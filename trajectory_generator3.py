@@ -89,7 +89,7 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
 
     # インデックス[0]だけを確実に渡して初期化
     def get_initial_angles(y_val, z_val):
-        ang = inverse_kinematics_3link(float(y_val), float(z_val), phi_deg=0.0)
+        ang = inverse_kinematics_3link(float(y_val), float(z_val))
         if ang is not None:
             return [np.clip(ang[j], LIMITS_MIN[j], LIMITS_MAX[j]) for j in range(3)]
         return [0.0, 0.0, 0.0]
@@ -100,7 +100,7 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
     for i in range(1, len(time_steps)):
         # --- 左腕の制限処理 ---
         # 【重要】float() で囲み、配列ではなく確実に1つの数値としてIKに渡す
-        angles_l = inverse_kinematics_3link(float(y_left[i]), float(z_left[i]), phi_deg=0.0)
+        angles_l = inverse_kinematics_3link(float(y_left[i]), float(z_left[i]))
         if angles_l is not None:
             limited_angles_l = []
             for j in range(3):
@@ -116,7 +116,7 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
             prev_angles_l = limited_angles_l
 
         # --- 右腕の制限処理 ---
-        angles_r = inverse_kinematics_3link(float(y_right[i]), float(z_right[i]), phi_deg=0.0)
+        angles_r = inverse_kinematics_3link(float(y_right[i]), float(z_right[i]))
         if angles_r is not None:
             limited_angles_r = []
             for j in range(3):
@@ -151,13 +151,13 @@ def export_all_files(midi_path, sampling_rate=10):
         LIMITS_MAX = [0.0, 120.0, 45.0]
 
         for i in range(len(t_steps)):
-            angles_l = inverse_kinematics_3link(float(y_l[i]), float(z_l[i]), phi_deg=0.0)
+            angles_l = inverse_kinematics_3link(float(y_l[i]), float(z_l[i]))
             if angles_l is not None:
                 th_a_l, th_b_l, th_c_l = [np.clip(float(angles_l[j]), LIMITS_MIN[j], LIMITS_MAX[j]) for j in range(3)]
             else:
                 th_a_l, th_b_l, th_c_l = 0.0, 0.0, 0.0
 
-            angles_r = inverse_kinematics_3link(float(y_r[i]), float(z_r[i]), phi_deg=0.0)
+            angles_r = inverse_kinematics_3link(float(y_r[i]), float(z_r[i]))
             if angles_r is not None:
                 th_a_r, th_b_r, th_c_r = [np.clip(float(angles_r[j]), LIMITS_MIN[j], LIMITS_MAX[j]) for j in range(3)]
             else:
