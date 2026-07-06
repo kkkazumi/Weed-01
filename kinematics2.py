@@ -1,68 +1,87 @@
 import numpy as np
 
+# 実機の物理的な可動限界 [deg]
+LIMITS_MIN = np.array([-60.0, -120.0, -135.0])
+LIMITS_MAX = np.array([0.0, 120.0, 45.0])
 
-def inverse_kinematics_3link(y_m, z_m, L_A=10.0, L_B=7.0, L_C=10.0):
-    """
-    平面3リンクアームの逆運動学 (IK) - 実機可動範囲（下向き基準）完全適合版
-    :param y_m: 手先の目標Y座標 [メートル]
-    :param z_m: 手先の目標Z座標 [メートル]
-    """
-    # 1. 単位を [m] から [cm] へ変換
-    y = float(y_m) * 100.0
-    z = float(z_m) * 100.0
+L_A = 10.0
+L_B = 7.0
+L_C = 10.0
 
-    # 手先（リンクC）の傾きphiは、ベースから目標点への直線の傾きに自然に追従させ、
-    # 関節への無理な折り曲げ負荷を逃がします
-    phi_rad = np.arctan2(z, y)
-
-    # 2. リンクCの根元（手首位置: y_w, z_w）を逆算
-    y_w = y - L_C * np.cos(phi_rad)
-    z_w = z - L_C * np.sin(phi_rad)
-
-    # 3. 余弦定理から第2関節（theta_b）の角度を計算
-    cos_theta_b = (y_w ** 2 + z_w ** 2 - L_A ** 2 - L_B ** 2) / (2.0 * L_A * L_B)
-    cos_theta_b = np.clip(cos_theta_b, -1.0, 1.0)
-
-    # 実機の構造（肘を下側に折り曲げるElbow-down解）を選択
-    sin_theta_b = -np.sqrt(1.0 - cos_theta_b ** 2)
-    theta_b_rad = np.arctan2(sin_theta_b, cos_theta_b)
-
-    # 4. 第1関節（theta_a）の幾何学計算
-    k1 = L_A + L_B * cos_theta_b
-    k2 = L_B * sin_theta_b
-    theta_a_rad = np.arctan2(z_w, y_w) - np.arctan2(k2, k1)
-    theta_a_rad = np.arctan2(np.sin(theta_a_rad), np.cos(theta_a_rad))
-
-    # 第3関節（theta_c）の計算
-    theta_c_rad = phi_rad - theta_a_rad - theta_b_rad
-
-    # 度数法 [deg] に変換
-    th_a = float(np.degrees(theta_a_rad))
-    th_b = float(np.degrees(theta_b_rad))
-    th_c = float(np.degrees(theta_c_rad))
-
-    return th_a, th_b, th_c
+# 前回の計算成功角度を保持するグローバル変数（解の跳躍を防止する基準点）
+_prev_angles_left = np.array([-30.0, -60.0, 35.0])
+_prev_angles_right = np.array([-30.0, -60.0, 35.0])
 
 
-def forward_kinematics_3link(theta_a, theta_b, theta_c, L_A=10.0, L_B=7.0, L_C=10.0):
-    """
-    各関節の座標を正確に出すための順運動学 (FK)
-    """
+def forward_kinematics_3link(theta_a, theta_b, theta_c):
+    """各関節の角度から、手先および各関節の座標(cm)を返す順運動学(FK)"""
     rad_a = np.radians(float(theta_a))
     rad_ab = np.radians(float(theta_a + theta_b))
     rad_abc = np.radians(float(theta_a + theta_b + theta_c))
 
     p0 = (0.0, 0.0, 0.0)
-
-    # 各関節の位置を地続きで累積足し算
     p1_y = float(L_A * np.cos(rad_a))
     p1_z = float(L_A * np.sin(rad_a))
-
     p2_y = float(p1_y + L_B * np.cos(rad_ab))
     p2_z = float(p1_z + L_B * np.sin(rad_ab))
-
     p3_y = float(p2_y + L_C * np.cos(rad_abc))
     p3_z = float(p2_z + L_C * np.sin(rad_abc))
 
-    # 2D描画に必要な [Y座標, Z座標] の形式に統一して返却
     return p0, (p1_y, p1_z, 0.0), (p2_y, p2_z, 0.0), (p3_y, p3_z, 0.0)
+
+
+def inverse_kinematics_3link(y_m, z_m):
+    """
+    【解の跳躍防止型・逆運動学】
+    幾何学的な2つの折り畳み候補（Elbow-Up / Down）を両方算出し、
+    前回の姿勢から最も移動量が少ない（地続きで滑らかな）候補を厳密に自動選択します。
+    """
+    global _prev_angles_left, _prev_angles_right
+
+    y = float(y_m) * 100.0
+    z = float(z_m) * 100.0
+
+    # 左右どちらのアームの計算かを目標座標の正負（左は負、右は正）で自動判定
+    is_right = (y_m > 0)
+    prev_q = _prev_angles_right if is_right else _prev_angles_left
+
+    phi_rad = np.arctan2(z, y)
+    y_w = y - L_C * np.cos(phi_rad)
+    z_w = z - L_C * np.sin(phi_rad)
+
+    cos_theta_b = (y_w ** 2 + z_w ** 2 - L_A ** 2 - L_B ** 2) / (2.0 * L_A * L_B)
+    cos_theta_b = np.clip(cos_theta_b, -1.0, 1.0)
+
+    # 候補①：Elbow-Down解（肘を下側に折る姿勢）
+    sin_b1 = -np.sqrt(1.0 - cos_theta_b ** 2)
+    th_b1_rad = np.arctan2(sin_b1, cos_theta_b)
+    th_a1_rad = np.arctan2(z_w, y_w) - np.arctan2(L_B * sin_b1, L_A + L_B * cos_theta_b)
+    th_a1_rad = np.arctan2(np.sin(th_a1_rad), np.cos(th_a1_rad))
+    th_c1_rad = phi_rad - th_a1_rad - th_b1_rad
+
+    q1 = np.array([np.degrees(th_a1_rad), np.degrees(th_b1_rad), np.degrees(th_c1_rad)])
+    q1 = np.clip(q1, LIMITS_MIN, LIMITS_MAX)
+
+    # 候補②：Elbow-Up解（肘を上側に折る姿勢）
+    sin_b2 = np.sqrt(1.0 - cos_theta_b ** 2)
+    th_b2_rad = np.arctan2(sin_b2, cos_theta_b)
+    th_a2_rad = np.arctan2(z_w, y_w) - np.arctan2(L_B * sin_b2, L_A + L_B * cos_theta_b)
+    th_a2_rad = np.arctan2(np.sin(th_a2_rad), np.cos(th_a2_rad))
+    th_c2_rad = phi_rad - th_a2_rad - th_b2_rad
+
+    q2 = np.array([np.degrees(th_a2_rad), np.degrees(th_b2_rad), np.degrees(th_c2_rad)])
+    q2 = np.clip(q2, LIMITS_MIN, LIMITS_MAX)
+
+    # 前回の角度(prev_q)と比べて、角度の変化総量（距離）が少ない方を採用
+    dist1 = np.linalg.norm(q1 - prev_q)
+    dist2 = np.linalg.norm(q2 - prev_q)
+
+    best_q = q1 if dist1 <= dist2 else q2
+
+    # 次回のために最新の確定角度をグローバルに記憶
+    if is_right:
+        _prev_angles_right = best_q.copy()
+    else:
+        _prev_angles_left = best_q.copy()
+
+    return float(best_q[0]), float(best_q[1]), float(best_q[2])
