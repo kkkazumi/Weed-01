@@ -14,7 +14,7 @@ if os.path.exists(delay_filename):
     with open(delay_filename, "r", encoding="utf-8") as f:
         t_interval = float(f.read().strip())
 else:
-    t_interval = 0.1  # デフォルト（10Hz）
+    t_interval = 0.1
 
 if os.path.exists(csv_filename):
     print(f"[{csv_filename}] から角度データを読み込みます。")
@@ -22,7 +22,6 @@ if os.path.exists(csv_filename):
     if data.ndim == 1:
         data = np.expand_dims(data, axis=0)
 
-    # データの各列を確実に1次元配列として抽出
     time_steps = data[:, 0]
     left_th_a = data[:, 1]
     left_th_b = data[:, 2]
@@ -31,139 +30,158 @@ if os.path.exists(csv_filename):
     right_th_b = data[:, 5]
     right_th_c = data[:, 6]
     frames = len(data)
+    print(f"データ読み込み成功: {frames} フレームの動きを再生します。")
 else:
-    print(f"[{csv_filename}] が見つからないため、デモ用の往復データを作成します。")
-    frames = 120
-    time_steps = np.linspace(0, frames * t_interval, frames)
-    t = np.linspace(0, 2 * np.pi, frames)
-    left_th_a = -30 - 30 * np.cos(t)
-    left_th_b = 120 * np.cos(t)
-    left_th_c = -45 - 90 * np.cos(t)
-    right_th_a = -30 - 30 * np.sin(t)
-    right_th_b = 120 * np.sin(t)
-    right_th_c = -45 - 90 * np.sin(t)
+    print(f"角度データ [{csv_filename}] が存在しません。先にtrajectory_generator3.pyを実行してください。")
+    exit()
 
-# ロボットのリンク長設定 (cm)
+# ロボットアームのリンク長 (cm)
 L_A = 10.0
 L_B = 7.0
 L_C = 10.0
 
 
-# ==========================================
-# 2. 順運動学(FK)の幾何学分解計算関数
-# ==========================================
 def calculate_fk_positions(th_a, th_b, th_c):
     """
-    配列の形を崩さないよう、純粋な変数に分解して順運動学の関節位置を計算する
+    実機の角度定義に基づき、各関節の3次元(X, Y, Z)の相対座標を累積計算する
     """
-    rad_a = np.radians(th_a)
-    rad_b = np.radians(th_b)
-    rad_c = np.radians(th_c)
+    rad_a = np.radians(float(th_a))
+    rad_ab = np.radians(float(th_a + th_b))
+    rad_abc = np.radians(float(th_a + th_b + th_c))
 
-    # 第1関節 (Arm a)
-    p1_x = -L_A * np.cos(rad_a)
-    p1_y = -L_A * np.sin(rad_a)
-    p1_z = 0.0
+    # 3軸平面アームとしての基本形 (奥行きX、高さY)
+    p0_x, p0_y, p0_z = 0.0, 0.0, 0.0
+    p1_x = L_A * np.cos(rad_a)
+    p1_y = L_A * np.sin(rad_a)
 
-    # 第2関節 (Arm b)
-    axis_b_x = np.sin(rad_a)
-    axis_b_y = -np.cos(rad_a)
-    axis_b_z = 0.0
+    p2_x = p1_x + L_B * np.cos(rad_ab)
+    p2_y = p1_y + L_B * np.sin(rad_ab)
 
-    p2_x = p1_x + L_B * axis_b_x
-    p2_y = p1_y + L_B * axis_b_y
-    p2_z = p1_z + L_B * axis_b_z
+    p3_x = p2_x + L_C * np.cos(rad_abc)
+    p3_y = p2_y + L_C * np.sin(rad_abc)
 
-    # 第3関節・手先 (Arm c)
-    cos_a, sin_a = np.cos(rad_a), np.sin(rad_a)
-    cos_b, sin_b = np.cos(rad_b), np.sin(rad_b)
-    dir_c_base = np.array([-cos_a * cos_b, -sin_a * cos_b, sin_b])
-    norm_c = np.linalg.norm(dir_c_base)
-    dir_c = dir_c_base / (norm_c if norm_c > 1e-6 else 1.0)
-
-    axis_c = np.array([-cos_a * sin_b, -sin_a * sin_b, -cos_b])
-    dir_c_rotated = dir_c * np.cos(rad_c) + np.cross(axis_c, dir_c) * np.sin(rad_c)
-
-    p3_x = p2_x + L_C * dir_c_rotated[0]
-    p3_y = p2_y + L_C * dir_c_rotated[1]
-    p3_z = p2_z + L_C * dir_c_rotated[2]
-
-    return (0.0, 0.0, 0.0), (p1_x, p1_y, p1_z), (p2_x, p2_y, p2_z), (p3_x, p3_y, p3_z)
+    return (p0_x, p0_y, p0_z), (p1_x, p1_y, 0.0), (p2_x, p2_y, 0.0), (p3_x, p3_y, 0.0)
 
 
 # ==========================================
-# 3. アニメーション設定と同期描画ループ
+# 2. 同期描画システム (4画面マルチアングル版)
 # ==========================================
 def start_synchronized_viewer(midi_path):
-    # Pygameで音楽再生準備
-    pygame.mixer.init()
-    pygame.mixer.music.load(midi_path)
+    try:
+        pygame.mixer.init()
+        pygame.mixer.music.load(midi_path)
+        has_music = True
+    except Exception as e:
+        print(f"音楽再生をスキップします: {e}")
+        has_music = False
 
+    # 豪華な2行×2列の4画面マルチモニターを初期化
     fig = plt.figure(figsize=(12, 10))
-    ax_xy = fig.add_subplot(221)  # ① 左上: XY 平面図
-    ax_3d = fig.add_subplot(222, projection='3d')  # ② 右上: 3D 座標
-    ax_zy = fig.add_subplot(223)  # ③ 左下: ZY 平面図
-    ax_xz = fig.add_subplot(224)  # ④ 右下: XZ 平面図
+    ax_xy = fig.add_subplot(221)  # ① 左上: XY平面（真上）
+    ax_3d = fig.add_subplot(222, projection='3d')  # ② 右上: 3Dマルチ
+    ax_zy = fig.add_subplot(223)  # ③ 左下: ZY平面（正面）
+    ax_xz = fig.add_subplot(224)  # ④ 右下: XZ平面（真横）
+
+    # 2Dグラフのレイアウト固定設定
+    for ax in [ax_xy, ax_zy, ax_xz]:
+        ax.set_xlim([-25, 25]);
+        ax.set_ylim([-35, 35]);
+        ax.grid(True);
+        ax.set_aspect('equal')
+
+    ax_xy.set_title("XY Plane View (Top View)");
+    ax_xy.set_xlabel("X (Depth)");
+    ax_xy.set_ylabel("Y (Left-Right)")
+    ax_zy.set_title("ZY Plane View (Front View)");
+    ax_zy.set_xlabel("Z (Up-Down)");
+    ax_zy.set_ylabel("Y (Left-Right)")
+    ax_xz.set_title("XZ Plane View (Side View)");
+    ax_xz.set_xlabel("X (Depth)");
+    ax_xz.set_ylabel("Z (Up-Down)")
+
+    # 3Dグラフのレイアウト設定
+    ax_3d.set_xlim([-25, 25]);
+    ax_3d.set_ylim([-35, 35]);
+    ax_3d.set_zlim([-25, 25])
+    ax_3d.set_xlabel('X (Depth)');
+    ax_3d.set_ylabel('Y (Left-Right)');
+    ax_3d.set_zlabel('Z (Up-Down)')
+    ax_3d.set_title('3D Multi-Arm View', pad=10)
+    ax_3d.view_init(elev=22, azim=-60)
+
+    # 描画オブジェクトの先行生成 (オブジェクトを再利用してフリーズを完璧に防止)
+    line_xy_l, = ax_xy.plot([], [], 'r-o', linewidth=3);
+    line_xy_r, = ax_xy.plot([], [], 'b-o', linewidth=3)
+    hist_xy_l, = ax_xy.plot([], [], 'r-', alpha=0.15);
+    hist_xy_r, = ax_xy.plot([], [], 'b-', alpha=0.15)
+
+    line_zy_l, = ax_zy.plot([], [], 'r-o', linewidth=3);
+    line_zy_r, = ax_zy.plot([], [], 'b-o', linewidth=3)
+    hist_zy_l, = ax_zy.plot([], [], 'r-', alpha=0.15);
+    hist_zy_r, = ax_zy.plot([], [], 'b-', alpha=0.15)
+
+    line_xz_l, = ax_xz.plot([], [], 'r-o', linewidth=3);
+    line_xz_r, = ax_xz.plot([], [], 'b-o', linewidth=3)
+    hist_xz_l, = ax_xz.plot([], [], 'r-', alpha=0.15);
+    hist_xz_r, = ax_xz.plot([], [], 'b-', alpha=0.15)
+
+    line_3d_l, = ax_3d.plot([], [], [], 'r-o', linewidth=3);
+    line_3d_r, = ax_3d.plot([], [], [], 'b-o', linewidth=3)
+    track_3d_l, = ax_3d.plot([], [], [], 'r-', alpha=0.15);
+    track_3d_r, = ax_3d.plot([], [], [], 'b-', alpha=0.15)
 
     fig.is_running = True
     fig.canvas.mpl_connect('close_event', lambda ev: setattr(fig, 'is_running', False))
 
     plt.ion()
     plt.show()
+    fig.canvas.draw()
+    fig.canvas.flush_events()
 
-    # 過去の手先移動軌跡を蓄積するリスト
+    # 過去の移動軌跡を蓄積するリスト
     hist_lx, hist_ly, hist_lz = [], [], []
     hist_rx, hist_ry, hist_rz = [], [], []
 
-    # 【超重要】音楽を再生する「前に」一度ダミー描画をしてウィンドウを完全に立ち上げる（ラグ防止）
-    fig.canvas.flush_events()
+    if has_music:
+        pygame.mixer.music.play()
 
-    # 音楽再生スタート
-    pygame.mixer.music.play()
-
-    # 【追加】Pygameの音楽再生が物理的に開始されるまで、最大1秒間確実に待機する（ラグによる即終了を100%防止）
-    start_wait = time.time()
-    while not pygame.mixer.music.get_busy():
-        if time.time() - start_wait > 1.0:
-            break
+    while has_music and not pygame.mixer.music.get_busy():
         time.sleep(0.01)
 
-    # ループ開始
+    start_real_time = time.time()
+
     while True:
         if not getattr(fig, 'is_running', True):
             break
 
-        # Pygameから現在の正確な音楽時間を取得
         raw_pos = pygame.mixer.music.get_pos()
-
-        # 音楽が正常に終了、または再生が終わった場合は安全にブレイク
         if raw_pos < 0 and not pygame.mixer.music.get_busy():
             break
 
         music_time = max(0.0, raw_pos / 1000.0)
-
-        # 音楽の秒数から、今読み込むべきCSVのインデックスを行計算
         current_idx = int(music_time / t_interval)
 
-        # データ全体のフレーム数を超えたら安全に終了
         if current_idx >= frames:
             break
 
         expected_time = time_steps[current_idx]
 
-        # 画面のクリア
-        ax_xy.cla()
-        ax_3d.cla()
-        ax_zy.cla()
-        ax_xz.cla()
+        if music_time < expected_time:
+            time.sleep(expected_time - music_time)
 
-        # --- 左右アームの順運動学(FK)計算 ---
+        # リアルタイム角度をコンソール（画面下部）に出力
+        print(
+            f"[Time: {expected_time:5.2f}s] "
+            f"LEFT: A={left_th_a[current_idx]:6.1f}, B={left_th_b[current_idx]:6.1f}, C={left_th_c[current_idx]:6.1f} | "
+            f"RIGHT: A={right_th_a[current_idx]:6.1f}, B={right_th_b[current_idx]:6.1f}, C={right_th_c[current_idx]:6.1f}"
+        )
+
+        # 順運動学(FK)計算
         p0_l, p1_l, p2_l, p3_l = calculate_fk_positions(left_th_a[current_idx], left_th_b[current_idx],
                                                         left_th_c[current_idx])
         p0_r, p1_r, p2_r, p3_r = calculate_fk_positions(right_th_a[current_idx], right_th_b[current_idx],
                                                         right_th_c[current_idx])
 
-        # タプルから X, Y, Z の数値を完全に分解
         p0_lx, p0_ly, p0_lz = p0_l;
         p1_lx, p1_ly, p1_lz = p1_l;
         p2_lx, p2_ly, p2_lz = p2_l;
@@ -173,11 +191,11 @@ def start_synchronized_viewer(midi_path):
         p2_rx, p2_ry, p2_rz = p2_r;
         p3_rx, p3_ry, p3_rz = p3_r
 
-        # 左右のベース位置オフセット調整
+        # 左右のベース位置オフセット設定 (左はY=-15cm, 右はY=+15cm)
         y_offset_l = -15.0
         y_offset_r = 15.0
 
-        # 軌跡ログの保存 (Y座標にだけオフセットを加算)
+        # 手先位置の軌跡データを蓄積 (YZ正面対称に対応)
         hist_lx.append(p3_lx);
         hist_ly.append(p3_ly + y_offset_l);
         hist_lz.append(p3_lz)
@@ -185,108 +203,57 @@ def start_synchronized_viewer(midi_path):
         hist_ry.append(p3_ry + y_offset_r);
         hist_rz.append(p3_rz)
 
-        info_text = (
-            f"Left Arm:\n  $\\theta_a$={left_th_a[current_idx]:.1f}$^\\circ$\n  $\\theta_b$={left_th_b[current_idx]:.1f}$^\\circ$\n"
-            f"Right Arm:\n  $\\theta_a$={right_th_a[current_idx]:.1f}$^\\circ$\n  $\\theta_b$={right_th_b[current_idx]:.1f}$^\\circ$\n"
-            f"-------\nHz: {1.0 / t_interval:.1f}")
+        # 各プロットの高速上書き更新
+        # ① XY平面（真上から）
+        line_xy_l.set_data([p0_lx, p1_lx, p2_lx, p3_lx],
+                           [p0_ly + y_offset_l, p1_ly + y_offset_l, p2_ly + y_offset_l, p3_ly + y_offset_l])
+        line_xy_r.set_data([p0_rx, p1_rx, p2_rx, p3_rx],
+                           [p0_ry + y_offset_r, p1_ry + y_offset_r, p2_ry + y_offset_r, p3_ry + y_offset_r])
+        hist_xy_l.set_data(hist_lx, hist_ly);
+        hist_xy_r.set_data(hist_rx, hist_ry)
 
-        # （既存の info_text 計算の下あたりに追加してください）
-        info_text = (f"Left Arm:\n  $\\theta_a$={left_th_a[current_idx]:.1f}$^\\circ$...") # 既存コード
+        # ② ZY平面（正面から）
+        line_zy_l.set_data([p0_lz, p1_lz, p2_lz, p3_lz],
+                           [p0_ly + y_offset_l, p1_ly + y_offset_l, p2_ly + y_offset_l, p3_ly + y_offset_l])
+        line_zy_r.set_data([p0_rz, p1_rz, p2_rz, p3_rz],
+                           [p0_ry + y_offset_r, p1_ry + y_offset_r, p2_ry + y_offset_r, p3_ry + y_offset_r])
+        hist_zy_l.set_data(hist_lz, hist_ly);
+        hist_zy_r.set_data(hist_rz, hist_ry)
 
-        # =======================================================
-        # 【新規追加】現在の左右の関節角度をコンソールにリアルタイム出力
-        # =======================================================
-        print(
-            f"[Time: {music_time:5.2f}s] "
-            f"LEFT:  A={left_th_a[current_idx]:6.1f}, B={left_th_b[current_idx]:6.1f}, C={left_th_c[current_idx]:6.1f} | "
-            f"RIGHT: A={right_th_a[current_idx]:6.1f}, B={right_th_b[current_idx]:6.1f}, C={right_th_c[current_idx]:6.1f}"
-        )
+        # ③ XZ平面（真横から）
+        line_xz_l.set_data([p0_lx, p1_lx, p2_lx, p3_lx], [p0_lz, p1_lz, p2_lz, p3_lz])
+        line_xz_r.set_data([p0_rx, p1_rx, p2_rx, p3_rx], [p0_rz, p1_rz, p2_rz, p3_rz])
+        hist_xz_l.set_data(hist_lx, hist_lz);
+        hist_xz_r.set_data(hist_rx, hist_rz)
 
-        # ==========================================
-        # ② 右上：3D ビュー
-        # ==========================================
-        ax_3d.plot([p0_lx, p1_lx], [p0_ly + y_offset_l, p1_ly + y_offset_l], [p0_lz, p1_lz], color='darkred',
-                   linewidth=3)
-        ax_3d.plot([p1_lx, p2_lx], [p1_ly + y_offset_l, p2_ly + y_offset_l], [p1_lz, p2_lz], color='red', linewidth=3)
-        ax_3d.plot([p2_lx, p3_lx], [p2_ly + y_offset_l, p3_ly + y_offset_l], [p2_lz, p3_lz], color='orange',
-                   linewidth=3)
-        ax_3d.scatter(p3_lx, p3_ly + y_offset_l, p3_lz, color='red', s=60, edgecolors='black')
-        ax_3d.plot(hist_lx, hist_ly, hist_lz, color='red', alpha=0.2, linewidth=1)
+        # ④ 3Dマルチアームビュー 【タイポ行を削除し、純粋な1次元配列としてZ軸を確実に更新します】
+        line_3d_l.set_data([p0_lx, p1_lx, p2_lx, p3_lx],
+                           [p0_ly + y_offset_l, p1_ly + y_offset_l, p2_ly + y_offset_l, p3_ly + y_offset_l])
+        line_3d_l.set_3d_properties(np.array([p0_lz, p1_lz, p2_lz, p3_lz], dtype=float))
 
-        ax_3d.plot([p0_rx, p1_rx], [p0_ry + y_offset_r, p1_ry + y_offset_r], [p0_rz, p1_rz], color='darkblue',
-                   linewidth=3)
-        ax_3d.plot([p1_rx, p2_rx], [p1_ry + y_offset_r, p2_ry + y_offset_r], [p1_rz, p2_rz], color='blue', linewidth=3)
-        ax_3d.plot([p2_rx, p3_rx], [p2_ry + y_offset_r, p3_ry + y_offset_r], [p2_rz, p3_rz], color='purple',
-                   linewidth=3)
-        ax_3d.scatter(p3_rx, p3_ry + y_offset_r, p3_rz, color='blue', s=60, edgecolors='black')
-        ax_3d.plot(hist_rx, hist_ry, hist_rz, color='blue', alpha=0.2, linewidth=1)
+        line_3d_r.set_data([p0_rx, p1_rx, p2_rx, p3_rx],
+                           [p0_ry + y_offset_r, p1_ry + y_offset_r, p2_ry + y_offset_r, p3_ry + y_offset_r])
+        line_3d_r.set_3d_properties(np.array([p0_rz, p1_rz, p2_rz, p3_rz], dtype=float))
 
-        ax_3d.set_xlim([-25, 25]);
-        ax_3d.set_ylim([-35, 35]);
-        ax_3d.set_zlim([-25, 25])
-        ax_3d.set_xlabel('X');
-        ax_3d.set_ylabel('Y');
-        ax_3d.set_zlabel('Z')
-        ax_3d.set_title('3D Multi-Arm View', pad=10)
-        ax_3d.view_init(elev=22, azim=-60)
-        ax_3d.text2D(0.02, 0.98, info_text, transform=ax_3d.transAxes, fontsize=8,
-                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='gray'))
+        track_3d_l.set_data(hist_lx, hist_ly);
+        track_3d_l.set_3d_properties(np.array(hist_lz, dtype=float))
+        track_3d_r.set_data(hist_rx, hist_ry);
+        track_3d_r.set_3d_properties(np.array(hist_rz, dtype=float))
 
-        # ==========================================
-        # ① 左上：XY 平面ビュー
-        # ==========================================
-        ax_xy.plot([p0_lx, p1_lx, p2_lx, p3_lx],
-                   [p0_ly + y_offset_l, p1_ly + y_offset_l, p2_ly + y_offset_l, p3_ly + y_offset_l], 'r-o', linewidth=2)
-        ax_xy.plot(hist_lx, hist_ly, color='red', alpha=0.2)
-        ax_xy.plot([p0_rx, p1_rx, p2_rx, p3_rx],
-                   [p0_ry + y_offset_r, p1_ry + y_offset_r, p2_ry + y_offset_r, p3_ry + y_offset_r], 'b-o', linewidth=2)
-        ax_xy.plot(hist_rx, hist_ry, color='blue', alpha=0.2)
-        ax_xy.set_xlim([-25, 25]);
-        ax_xy.set_ylim([-35, 35])
-        ax_xy.set_xlabel('X axis');
-        ax_xy.set_ylabel('Y axis')
-        ax_xy.set_title('XY Plane View (Top View)', pad=10)
-        ax_xy.grid(True);
-        ax_xy.set_aspect('equal')
+        # 全体タイトルの更新
+        fig.suptitle(f'Robot Arm Synchronized Drive [Music Time: {music_time:.2f}s]', fontsize=13)
 
-        # ==========================================
-        # ③ 左下：ZY 平面ビュー
-        # ==========================================
-        ax_zy.plot([p0_lz, p1_lz, p2_lz, p3_lz],
-                   [p0_ly + y_offset_l, p1_ly + y_offset_l, p2_ly + y_offset_l, p3_ly + y_offset_l], 'r-o', linewidth=2)
-        ax_zy.plot(hist_lz, hist_ly, color='red', alpha=0.2)
-        ax_zy.plot([p0_rz, p1_rz, p2_rz, p3_rz],
-                   [p0_ry + y_offset_r, p1_ry + y_offset_r, p2_ry + y_offset_r, p3_ry + y_offset_r], 'b-o', linewidth=2)
-        ax_zy.plot(hist_rz, hist_ry, color='blue', alpha=0.2)
-        ax_zy.set_xlim([-25, 25]);
-        ax_zy.set_ylim([-35, 35])
-        ax_zy.set_xlabel('Z axis');
-        ax_zy.set_ylabel('Y axis')
-        ax_zy.set_title('ZY Plane View (Front View)', pad=10)
-        ax_zy.grid(True);
-        ax_zy.set_aspect('equal')
-
-        # ==========================================
-        # ④ 右下：XZ 平面ビュー
-        # ==========================================
-        ax_xz.plot([p0_lx, p1_lx, p2_lx, p3_lx], [p0_lz, p1_lz, p2_lz, p3_lz], 'r-o', linewidth=2)
-        ax_xz.plot(hist_lx, hist_lz, color='red', alpha=0.2)
-        ax_xz.plot([p0_rx, p1_rx, p2_rx, p3_rx], [p0_rz, p1_rz, p2_rz, p3_rz], 'b-o', linewidth=2)
-        ax_xz.plot(hist_rx, hist_rz, color='blue', alpha=0.2)
-        ax_xz.set_xlim([-25, 25]);
-        ax_xz.set_ylim([-25, 25])
-        ax_xz.set_xlabel('X axis');
-        ax_xz.set_ylabel('Z axis')
-        ax_xz.set_title('XZ Plane View (Side View)', pad=10)
-        ax_xz.grid(True);
-        ax_xz.set_aspect('equal')
-
-        fig.suptitle(f'Robot Arm Synchronized Drive [Music Time: {music_time:.2f}s]', fontsize=13, y=0.96)
-
-        # 【超重要修正】後回し予約(draw_idle)を完全に廃止し、その場で強制的に画面を書き換えさせます
-        # これにより、データの渋滞が完全に消滅し、アームが確実にリアルタイムで動き出します
+        # 画面の即時リフレッシュ強制執行
         fig.canvas.draw()
         fig.canvas.flush_events()
 
-        # サンプリング周期(10Hz = 0.1秒)に合わせて、少しだけパソコンを休ませる適正ウェイト
-        time.sleep(0.05)
+    if has_music:
+        pygame.mixer.music.stop()
+    plt.ioff()
+    print("--- シミュレーション正常終了 ---")
+    plt.show()
+
+
+if __name__ == '__main__':
+    midi_file = "radetzky.mid"
+    start_synchronized_viewer(midi_file)
