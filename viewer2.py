@@ -156,6 +156,14 @@ def start_synchronized_viewer(midi_path):
             f"Right Arm:\n  $\\theta_a$={right_th_a[frame]:.1f}$^\\circ$\n  $\\theta_b$={right_th_b[frame]:.1f}$^\\circ$\n"
             f"-------\nHz: {1.0 / t_interval:.1f}")
 
+        # 現在の各アームの角度（θa、θb）をコンソール（画面下部）に分かりやすくリアルタイム出力
+        print(
+            f"--- [Time: {expected_time:.2f}s / Hz: {1.0 / t_interval:.1f}] ---\n"
+            f"  Left Arm : theta_a = {left_th_a[frame]:6.1f} deg | theta_b = {left_th_b[frame]:6.1f} deg\n"
+            f"  Right Arm: theta_a = {right_th_a[frame]:6.1f} deg | theta_b = {right_th_b[frame]:6.1f} deg"
+        )
+
+
         # ==========================================
         # ② 右上：3D ビュー (左右両腕を同時プロット)
         # ==========================================
@@ -234,5 +242,5 @@ def start_synchronized_viewer(midi_path):
 
 
 if __name__ == '__main__':
-    midi_file = "airsulg.mid"
+    midi_file = "radetzky.mid"
     start_synchronized_viewer(midi_file)
