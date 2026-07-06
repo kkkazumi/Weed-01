@@ -7,14 +7,12 @@ from kinematics2 import inverse_kinematics_3link, forward_kinematics_3link
 def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10):
     """
     MIDI から左右の手先軌道を生成し、
-    YZ平面に対して完全に左右対称になるようにマッピングした上で、サーボ制限と可動範囲制限をかける。
+    曲の展開（前半・後半）に合わせたダンスバリエーションと無限大ループ軌道を自動生成する。
     """
     pm = pretty_midi.PrettyMIDI(midi_path)
 
     # 1. テンポ(BPM)と 1 小節あたりの時間を計算
     tempo_times, tempo_bpms = pm.get_tempo_changes()
-
-    # 【超重要修正】配列に複数のテンポ（BPM）が入っていても、先頭の要素[0]を指定して安全に数値化します
     if hasattr(tempo_bpms, "__len__") and len(tempo_bpms) > 0:
         bpm = float(tempo_bpms[0])
     else:
@@ -41,7 +39,10 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
     y_right_ref = np.full_like(base_time_steps, 0.15)
     z_right_ref = np.full_like(base_time_steps, 0.2)
 
-    # 2. MIDI ノートのスキャンとマッピング
+    # 曲の半分（中間地点）をサビの切り替えフラグにする
+    mid_point_idx = len(base_time_steps) // 2
+
+    # 2. MIDI ノートのスキャンと多バリエーションマッピング
     for instrument in pm.instruments:
         if instrument.is_drum:
             continue
@@ -57,23 +58,61 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
             if end_idx > len(base_time_steps):
                 end_idx = len(base_time_steps)
 
-            # 可動範囲(theta_a: -60〜0度)に収まる安全な目標位置 [m]
-            target_z = 0.08 + (note.pitch - 36) / (96 - 36) * 0.12  # 8cm 〜 20cm
-            target_z = np.clip(target_z, 0.08, 0.20)
+            n_frames = end_idx - start_idx
+            if n_frames <= 0:
+                continue
 
-            spread = (note.velocity / 127.0) * 0.07  # 最大7cmに制限
-            target_y_left = -0.12 - spread  # -12cm 〜 -19cm
-            target_y_right = 0.12 + spread  # 12cm 〜 19cm
+            # --- 【バリエーション強化①】曲の展開によるセクション切り替え ---
+            if start_idx < mid_point_idx:
+                # 前半セクション：音高に応じたなめらかな上下 ＆ ベロシティによる広がり
+                target_z = 0.08 + (note.pitch - 36) / (96 - 36) * 0.10
+                spread = (note.velocity / 127.0) * 0.06
 
-            z_left_ref[start_idx:end_idx] = target_z
-            z_right_ref[start_idx:end_idx] = target_z
-            y_left_ref[start_idx:end_idx] = target_y_left
-            y_right_ref[start_idx:end_idx] = target_y_right
+                target_y_left = -0.12 - spread
+                target_y_right = 0.12 + spread
+
+                # なめらかな直線スライド
+                start_z_l = z_left_ref[start_idx - 1] if start_idx > 0 else 0.2
+                start_y_l = y_left_ref[start_idx - 1] if start_idx > 0 else -0.15
+                start_y_r = y_right_ref[start_idx - 1] if start_idx > 0 else 0.15
+
+                z_left_ref[start_idx:end_idx] = np.linspace(start_z_l, target_z, n_frames)
+                z_right_ref[start_idx:end_idx] = np.linspace(start_z_l, target_z, n_frames)
+                y_left_ref[start_idx:end_idx] = np.linspace(start_y_l, target_y_left, n_frames)
+                y_right_ref[start_idx:end_idx] = np.linspace(start_y_r, target_y_right, n_frames)
+            else:
+                # 後半（サビ）セクション：強弱のメリハリを2乗で強化し、左右交互にビートを刻むドラムダンス
+                spread = ((note.velocity / 127.0) ** 2) * 0.08  # メリハリのキレを強化
+                target_y_left = -0.11 - spread
+                target_y_right = 0.11 + spread
+
+                # 左右交互（オルタネイト）に激しく高さを上下させる
+                if note.pitch % 2 == 0:
+                    z_left_ref[start_idx:end_idx] = 0.18
+                    z_right_ref[start_idx:end_idx] = 0.08
+                else:
+                    z_left_ref[start_idx:end_idx] = 0.08
+                    z_right_ref[start_idx:end_idx] = 0.18
+
+                y_left_ref[start_idx:end_idx] = target_y_left
+                y_right_ref[start_idx:end_idx] = target_y_right
+
+            # --- 【バリエーション強化②】長い音符での無限大（∞）ループ軌道の発生 ---
+            if n_frames >= int(sampling_rate * 1.0):  # 1秒以上の長い音符の場合
+                t_loop = np.linspace(0, 2 * np.pi, n_frames)
+                # 数学的なクロソイド/レムニスケート（8の字）軌道を満たす数式
+                loop_y = 0.03 * np.sin(t_loop)
+                loop_z = 0.03 * np.sin(2 * t_loop) / 2.0
+
+                y_left_ref[start_idx:end_idx] += loop_y
+                y_right_ref[start_idx:end_idx] -= loop_y  # 鏡像対称
+                z_left_ref[start_idx:end_idx] += loop_z
+                z_right_ref[start_idx:end_idx] += loop_z
 
     # =======================================================
-    # 3. 論文式(4)に基づく時間軸の引き延ばし ＆ 地続き線形補間
+    # 3. 論文に準拠した時間軸の引き延ばし ＆ 地続き線形補間
     # =======================================================
-    MAX_DEG_PER_SEC = 60.0  # 実機の速度上限 [deg/s]
+    MAX_DEG_PER_SEC = 60.0
     MAX_CHANGE_PER_FRAME = MAX_DEG_PER_SEC * dt
 
     LIMITS_MIN = [-60.0, -120.0, -135.0]
@@ -86,7 +125,6 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
             return [np.clip(ang[j], LIMITS_MIN[j], LIMITS_MAX[j]) for j in range(3)]
         return [-30.0, -60.0, 35.0]
 
-    # 【根本解決】IndexErrorを防ぐため、1コマ目の初期値をあらかじめリストに入れて初期化します
     optimized_times = [0.0]
     optimized_y_l = [y_left_ref[0]]
     optimized_z_l = [z_left_ref[0]]
@@ -104,17 +142,13 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
         for j in range(3):
             max_diff = max(max_diff, abs(next_ang_l[j] - prev_ang_l[j]), abs(next_ang_r[j] - prev_ang_r[j]))
 
-        # 論文式(4): 最小必要時間のフレーム数算出
         needed_frames = int(np.ceil(max_diff / MAX_CHANGE_PER_FRAME))
-        needed_frames = max(1, needed_frames)  # 最低1フレーム
+        needed_frames = max(1, needed_frames)
 
         step_dt = needed_frames * dt
-
-        # 時間軸の更新
         new_time = optimized_times[-1] + step_dt
         optimized_times.append(new_time)
 
-        # 【バグ完全排除】リストの最後の数値を安全に取り出し、1コマずつ綺麗な坂道(linspace)で隙間を補間
         last_y_l = optimized_y_l[-1][-1] if hasattr(optimized_y_l[-1], "__len__") else optimized_y_l[-1]
         last_z_l = optimized_z_l[-1][-1] if hasattr(optimized_z_l[-1], "__len__") else optimized_z_l[-1]
         last_y_r = optimized_y_r[-1][-1] if hasattr(optimized_y_r[-1], "__len__") else optimized_y_r[-1]
@@ -128,7 +162,6 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
         prev_ang_l = next_ang_l
         prev_ang_r = next_ang_r
 
-    # 各アームの配列の平坦化 (入れ子リストの解除)
     def flatten_list(nested_list):
         flat = []
         for item in nested_list:
@@ -143,12 +176,11 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
     flat_y_r = flatten_list(optimized_y_r)
     flat_z_r = flatten_list(optimized_z_r)
 
-    # 拡張した総時間に合わせた新しいリサンプリング時間軸の生成
     total_duration = optimized_times[-1]
     total_frames = len(flat_y_l)
     final_time_steps = np.linspace(0, total_duration, total_frames)
 
-    # 4. なだらかなS字躍動スプライン(Minimum Jerk)を適用
+    # 4. なだらかなS字躍動スプラインの適用
     window_size = int(sampling_rate * 0.40)
     if window_size > 1:
         kernel = np.ones(window_size) / window_size
@@ -183,13 +215,19 @@ def export_all_files(midi_path, sampling_rate=10):
         for i in range(len(t_steps)):
             angles_l = inverse_kinematics_3link(float(y_l[i]), float(z_l[i]))
             if angles_l is not None:
-                th_a_l, th_b_l, th_c_l = [np.clip(float(angles_l[j]), LIMITS_MIN[j], LIMITS_MAX[j]) for j in range(3)]
+                # 【重要修正】周期ワープバグを消去するため、配列の先頭要素から個別に安全に抽出
+                th_a_l = min(0.0, max(-60.0, float(angles_l[0])))
+                th_b_l = min(120.0, max(-120.0, float(angles_l[1])))
+                th_c_l = min(45.0, max(-135.0, float(angles_l[2])))
             else:
                 th_a_l, th_b_l, th_c_l = -30.0, -60.0, 35.0
 
             angles_r = inverse_kinematics_3link(float(-y_r[i]), float(z_r[i]))
             if angles_r is not None:
-                th_a_r, th_b_r, th_c_r = [np.clip(float(angles_r[j]), LIMITS_MIN[j], LIMITS_MAX[j]) for j in range(3)]
+                # 【重要修正】右腕も同様にインデックスから安全に抽出
+                th_a_r = min(0.0, max(-60.0, float(angles_r[0])))
+                th_b_r = min(120.0, max(-120.0, float(angles_r[1])))
+                th_c_r = min(45.0, max(-135.0, float(angles_r[2])))
             else:
                 th_a_r, th_b_r, th_c_r = -30.0, -60.0, 35.0
 
