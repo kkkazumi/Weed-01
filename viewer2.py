@@ -121,20 +121,31 @@ def start_synchronized_viewer(midi_path):
     # 音楽再生スタート
     pygame.mixer.music.play()
 
-    # インデックスを追うための変数
-    current_idx = 0
+    # 【追加】Pygameの音楽再生が物理的に開始されるまで、最大1秒間確実に待機する（ラグによる即終了を100%防止）
+    start_wait = time.time()
+    while not pygame.mixer.music.get_busy():
+        if time.time() - start_wait > 1.0:
+            break
+        time.sleep(0.01)
 
-    # 【大改造】音楽の実際の再生位置（実時間）に完全に追従するループ
-    while pygame.mixer.music.get_busy() and current_idx < frames:
+    # ループ開始
+    while True:
         if not getattr(fig, 'is_running', True):
             break
 
-        # Pygameから「今、音楽が何秒目か」を厳密に取得（1ミリ秒単位）
-        music_time = pygame.mixer.music.get_pos() / 1000.0
+        # Pygameから現在の正確な音楽時間を取得
+        raw_pos = pygame.mixer.music.get_pos()
 
-        # 音楽の時間に最も近いCSVデータの行（インデックス）を探し出す
-        # ※ これにより、パソコンの処理落ちや起動ラグがあっても、音と映像が絶対にズレなくなります
-        current_idx = np.searchsorted(time_steps, music_time)
+        # 音楽が正常に終了、または再生が終わった場合は安全にブレイク
+        if raw_pos < 0 and not pygame.mixer.music.get_busy():
+            break
+
+        music_time = max(0.0, raw_pos / 1000.0)
+
+        # 音楽の秒数から、今読み込むべきCSVのインデックスを行計算
+        current_idx = int(music_time / t_interval)
+
+        # データ全体のフレーム数を超えたら安全に終了
         if current_idx >= frames:
             break
 
@@ -152,7 +163,7 @@ def start_synchronized_viewer(midi_path):
         p0_r, p1_r, p2_r, p3_r = calculate_fk_positions(right_th_a[current_idx], right_th_b[current_idx],
                                                         right_th_c[current_idx])
 
-        # 【安全対策】タプルから X, Y, Z の数値を完全にバラバラに分解します
+        # タプルから X, Y, Z の数値を完全に分解
         p0_lx, p0_ly, p0_lz = p0_l;
         p1_lx, p1_ly, p1_lz = p1_l;
         p2_lx, p2_ly, p2_lz = p2_l;
@@ -179,10 +190,21 @@ def start_synchronized_viewer(midi_path):
             f"Right Arm:\n  $\\theta_a$={right_th_a[current_idx]:.1f}$^\\circ$\n  $\\theta_b$={right_th_b[current_idx]:.1f}$^\\circ$\n"
             f"-------\nHz: {1.0 / t_interval:.1f}")
 
+        # （既存の info_text 計算の下あたりに追加してください）
+        info_text = (f"Left Arm:\n  $\\theta_a$={left_th_a[current_idx]:.1f}$^\\circ$...") # 既存コード
+
+        # =======================================================
+        # 【新規追加】現在の左右の関節角度をコンソールにリアルタイム出力
+        # =======================================================
+        print(
+            f"[Time: {music_time:5.2f}s] "
+            f"LEFT:  A={left_th_a[current_idx]:6.1f}, B={left_th_b[current_idx]:6.1f}, C={left_th_c[current_idx]:6.1f} | "
+            f"RIGHT: A={right_th_a[current_idx]:6.1f}, B={right_th_b[current_idx]:6.1f}, C={right_th_c[current_idx]:6.1f}"
+        )
+
         # ==========================================
-        # ② 右上：3D ビュー (すべて数値の変数でプロット)
+        # ② 右上：3D ビュー
         # ==========================================
-        # 左腕 (赤系統)
         ax_3d.plot([p0_lx, p1_lx], [p0_ly + y_offset_l, p1_ly + y_offset_l], [p0_lz, p1_lz], color='darkred',
                    linewidth=3)
         ax_3d.plot([p1_lx, p2_lx], [p1_ly + y_offset_l, p2_ly + y_offset_l], [p1_lz, p2_lz], color='red', linewidth=3)
@@ -191,7 +213,6 @@ def start_synchronized_viewer(midi_path):
         ax_3d.scatter(p3_lx, p3_ly + y_offset_l, p3_lz, color='red', s=60, edgecolors='black')
         ax_3d.plot(hist_lx, hist_ly, hist_lz, color='red', alpha=0.2, linewidth=1)
 
-        # 右腕 (青系統)
         ax_3d.plot([p0_rx, p1_rx], [p0_ry + y_offset_r, p1_ry + y_offset_r], [p0_rz, p1_rz], color='darkblue',
                    linewidth=3)
         ax_3d.plot([p1_rx, p2_rx], [p1_ry + y_offset_r, p2_ry + y_offset_r], [p1_rz, p2_rz], color='blue', linewidth=3)
@@ -260,18 +281,12 @@ def start_synchronized_viewer(midi_path):
         ax_xz.grid(True);
         ax_xz.set_aspect('equal')
 
-        # タイトルに実際の音楽の再生時間を表示
         fig.suptitle(f'Robot Arm Synchronized Drive [Music Time: {music_time:.2f}s]', fontsize=13, y=0.96)
 
-        # 短いウェイトを入れて画面更新（CPU負荷軽減）
-        plt.pause(0.01)
+        # 【超重要修正】後回し予約(draw_idle)を完全に廃止し、その場で強制的に画面を書き換えさせます
+        # これにより、データの渋滞が完全に消滅し、アームが確実にリアルタイムで動き出します
+        fig.canvas.draw()
+        fig.canvas.flush_events()
 
-    pygame.mixer.music.stop()
-    plt.ioff()
-    print("--- 演奏およびシミュレーションが同時に終了しました ---")
-    plt.show()
-
-
-if __name__ == '__main__':
-    midi_file = "radetzky.mid"
-    start_synchronized_viewer(midi_file)
+        # サンプリング周期(10Hz = 0.1秒)に合わせて、少しだけパソコンを休ませる適正ウェイト
+        time.sleep(0.05)

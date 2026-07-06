@@ -1,7 +1,7 @@
 import csv
 import numpy as np
 import pretty_midi
-from kinematics import inverse_kinematics_3link, forward_kinematics_3link
+from kinematics2 import inverse_kinematics_3link, forward_kinematics_3link
 
 
 def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10):
@@ -56,18 +56,20 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
             if end_idx > len(time_steps):
                 end_idx = len(time_steps)
 
-            # 【マッピング修正】可動範囲(theta_a: -60〜0度)に収まる安全な手先位置
-            target_z = 0.05 + (note.pitch - 36) / (96 - 36) * 0.15
-            target_z = np.clip(target_z, 0.05, 0.20)
+            # 【マッピング調整】実機アーム(合計27cm)が絶対に無理なく届く「安全演奏エリア」にスケール
+            # 音高が高くなるほど上（Zプラス）、低くなると下へ
+            target_z = 0.08 + (note.pitch - 36) / (96 - 36) * 0.12  # 8cm 〜 20cm
+            target_z = np.clip(target_z, 0.08, 0.20)
 
-            spread = (note.velocity / 127.0) * 0.08
-            target_y_left = -0.10 - spread  # 左腕はマイナス方向（外側）へ広がる
-            target_y_right = 0.10 + spread  # 右腕はプラス方向（外側）へ広がる
+            # 音量が大きくなるほど、外側（Yの遠く）へアームを伸ばす
+            spread = (note.velocity / 127.0) * 0.07  # 広がり幅を最大7cmに制限
+            target_y_left = -0.12 - spread  # -12cm 〜 -19cm
+            target_y_right = 0.12 + spread  # 10cm 〜 19cm
 
             # なめらかな直線補間の計算
             n_frames = end_idx - start_idx
             if n_frames > 0:
-                # Z軸 (高さ)
+                # 【バグ修正】Z軸（高さ）の補間には、確実に直前の「Z軸（z_left）」の過去座標を代入します
                 start_z_l = z_left[start_idx - 1] if start_idx > 0 else 0.2
                 z_left[start_idx:end_idx] = np.linspace(start_z_l, target_z, n_frames)
                 z_right[start_idx:end_idx] = np.linspace(start_z_l, target_z, n_frames)
@@ -88,7 +90,7 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
         z_right = np.convolve(z_right, kernel, mode='same')
 
     # =======================================================
-    # 4. FKフィードバック型・二重リミッター処理 (左右対称対応)
+    # 4. FKフィードバック型・二重リミッター処理
     # =======================================================
     MAX_DEG_PER_SEC = 60.0
     MAX_CHANGE_PER_FRAME = MAX_DEG_PER_SEC * dt
@@ -97,18 +99,19 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
     LIMITS_MAX = [0.0, 120.0, 45.0]
 
     def get_initial_angles(y_val, z_val):
-        ang = inverse_kinematics_3link(float(y_val), float(z_val), phi_deg=0.0)
+        # 【修正】引数の phi_deg=0.0 を削除
+        ang = inverse_kinematics_3link(float(y_val), float(z_val))
         if ang is not None:
             return [np.clip(ang[j], LIMITS_MIN[j], LIMITS_MAX[j]) for j in range(3)]
         return [0.0, 0.0, 0.0]
 
     prev_angles_l = get_initial_angles(y_left[0], z_left[0])
-    # 右腕はベース位置を左アームと同じ座標系（マイナス側）に一度鏡像反転してIKの初期値を計算します
     prev_angles_r = get_initial_angles(-y_right[0], z_right[0])
 
     for i in range(1, len(time_steps)):
         # --- 左腕の制限・フィードバック処理 ---
-        angles_l = inverse_kinematics_3link(float(y_left[i]), float(z_left[i]), phi_deg=0.0)
+        # 【修正】引数の phi_deg=0.0 を削除
+        angles_l = inverse_kinematics_3link(float(y_left[i]), float(z_left[i]))
         if angles_l is not None:
             limited_angles_l = []
             for j in range(3):
@@ -118,6 +121,7 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
                 limited_angles_l.append(next_ang_clamped)
 
             _, _, _, p3_l = forward_kinematics_3link(*limited_angles_l)
+            # タプルの1番目(X)をY軸、2番目(Y)をZ軸にマッピング
             y_left[i] = float(p3_l[0]) / 100.0
             z_left[i] = float(p3_l[1]) / 100.0
             prev_angles_l = limited_angles_l
@@ -125,9 +129,9 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
             y_left[i] = y_left[i - 1]
             z_left[i] = z_left[i - 1]
 
-        # --- 右腕の制限・フィードバック処理 【超重要：YZ平面対称反転】 ---
-        # 右腕の目標Y座標の符号を反転（-y_right）させることで、左腕モデルの可動範囲設定をそのまま流用して鏡像のIKを解きます
-        angles_r = inverse_kinematics_3link(float(-y_right[i]), float(z_right[i]), phi_deg=0.0)
+        # --- 右腕の制限・フィードバック処理 ---
+        # 【修正】引数の phi_deg=0.0 を削除
+        angles_r = inverse_kinematics_3link(float(-y_right[i]), float(z_right[i]))
         if angles_r is not None:
             limited_angles_r = []
             for j in range(3):
@@ -137,7 +141,6 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
                 limited_angles_r.append(next_ang_clamped)
 
             _, _, _, p3_r = forward_kinematics_3link(*limited_angles_r)
-            # 逆算したFK結果のY座標の符号を元に戻して右腕の現在地を確定
             y_right[i] = float(-p3_r[0]) / 100.0
             z_right[i] = float(p3_r[1]) / 100.0
             prev_angles_r = limited_angles_r
@@ -166,18 +169,19 @@ def export_all_files(midi_path, sampling_rate=10):
         LIMITS_MAX = [0.0, 120.0, 45.0]
 
         for i in range(len(t_steps)):
-            angles_l = inverse_kinematics_3link(float(y_l[i]), float(z_l[i]), phi_deg=0.0)
+            # 【修正】phi_deg=0.0 を完全に消去しました
+            angles_l = inverse_kinematics_3link(float(y_l[i]), float(z_l[i]))
             if angles_l is not None:
                 th_a_l, th_b_l, th_c_l = [np.clip(float(angles_l[j]), LIMITS_MIN[j], LIMITS_MAX[j]) for j in range(3)]
             else:
-                th_a_l, th_b_l, th_c_l = 0.0, 0.0, 0.0
+                th_a_l, th_b_l, th_c_l = -60.0, 120.0, 0.0
 
-            # 【重要】右腕用の角度CSVにも、反転した手先位置から算出した「対称角度」を正確に記録します
-            angles_r = inverse_kinematics_3link(float(-y_r[i]), float(z_r[i]), phi_deg=0.0)
+            # 【修正】phi_deg=0.0 を完全に消去しました
+            angles_r = inverse_kinematics_3link(float(-y_r[i]), float(z_r[i]))
             if angles_r is not None:
                 th_a_r, th_b_r, th_c_r = [np.clip(float(angles_r[j]), LIMITS_MIN[j], LIMITS_MAX[j]) for j in range(3)]
             else:
-                th_a_r, th_b_r, th_c_r = 0.0, 0.0, 0.0
+                th_a_r, th_b_r, th_c_r = -60.0, 120.0, 0.0
 
             writer.writerow([
                 f"{t_steps[i]:.3f}",
@@ -190,7 +194,7 @@ def export_all_files(midi_path, sampling_rate=10):
 
     with open("duration.txt", mode='w', encoding='utf-8') as f:
         f.write(f"{total_duration:.2f}\n")
-    print("--- 左右対称＆実機仕様制限付き 角度ファイルエクスポート完了 ---")
+    print("--- 左右対称＆数値的IK対応 角度ファイルエクスポート完了 ---")
 
 
 if __name__ == '__main__':
