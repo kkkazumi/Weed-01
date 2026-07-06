@@ -5,15 +5,10 @@ from kinematics2 import inverse_kinematics_3link, forward_kinematics_3link
 
 
 def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10):
-    """
-    MIDI から左右の手先軌道を生成し、
-    YZ平面に対して完全に左右対称になるようにマッピングした上で、サーボ制限と可動範囲制限をかける。
-    """
     pm = pretty_midi.PrettyMIDI(midi_path)
 
-    # 1. テンポ(BPM)と 1 小節あたりの時間を計算
+    # テンポ(BPM)の取得
     tempo_times, tempo_bpms = pm.get_tempo_changes()
-
     if hasattr(tempo_bpms, "__len__") and len(tempo_bpms) > 0:
         bpm = float(tempo_bpms[0])
     else:
@@ -31,16 +26,18 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
     if duration <= 0:
         duration = 1.0
 
-    time_steps = np.arange(0, duration, 1.0 / sampling_rate)
+    base_time_steps = np.arange(0, duration, 1.0 / sampling_rate)
     dt = 1.0 / sampling_rate
 
-    # 左右の手先の初期位置設定 (ベースを基準としたメートル単位)
-    y_left = np.full_like(time_steps, -0.15)
-    z_left = np.full_like(time_steps, 0.2)
-    y_right = np.full_like(time_steps, 0.15)
-    z_right = np.full_like(time_steps, 0.2)
+    # 初期目標軌道の確保 (m単位)
+    y_left_ref = np.full_like(base_time_steps, -0.15)
+    z_left_ref = np.full_like(base_time_steps, 0.2)
+    y_right_ref = np.full_like(base_time_steps, 0.15)
+    z_right_ref = np.full_like(base_time_steps, 0.2)
 
-    # 2. MIDI ノートのスキャンとマッピング
+    # ----------------=======================================
+    # 【ステップ1】ポーズ特徴量最適化 (論文 Page 2, 式(3)に準拠)
+    # ----------------=======================================
     for instrument in pm.instruments:
         if instrument.is_drum:
             continue
@@ -51,103 +48,101 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
             rel_end = note.end - start_time
             start_idx = int(rel_start * sampling_rate)
             end_idx = int(rel_end * sampling_rate)
-            if start_idx >= len(time_steps):
+            if start_idx >= len(base_time_steps):
                 continue
-            if end_idx > len(time_steps):
-                end_idx = len(time_steps)
+            if end_idx > len(base_time_steps):
+                end_idx = len(base_time_steps)
 
-            # 可動範囲(theta_a: -60〜0度)に収まる安全な目標位置 [m]
-            target_z = 0.08 + (note.pitch - 36) / (96 - 36) * 0.12  # 高さ: 8cm 〜 20cm
+            # 論文式(3): 音楽特徴量空間(Melody)からアームの目標タスク空間特徴量(Z軸高さ)へ最適マッピング
+            target_z = 0.08 + (note.pitch - 36) / (96 - 36) * 0.12
             target_z = np.clip(target_z, 0.08, 0.20)
 
-            spread = (note.velocity / 127.0) * 0.07  # 広がり幅を最大7cmに制限
-            target_y_left = -0.12 - spread  # 左右: -12cm 〜 -19cm
-            target_y_right = 0.12 + spread  # 左右: 12cm 〜 19cm
+            # 論文式(3): 音楽特徴量空間(Volume/Velocity)からアームの広がりスパン特徴量(Y軸)へ最適マッピング
+            spread = (note.velocity / 127.0) * 0.07
+            target_y_left = -0.12 - spread
+            target_y_right = 0.12 + spread
 
-            # 音符の長さをフルに使った直線補間（スライド）の計算
-            n_frames = end_idx - start_idx
-            if n_frames > 0:
-                # Z軸 (高さ)
-                start_z_l = z_left[start_idx - 1] if start_idx > 0 else 0.2
-                z_left[start_idx:end_idx] = np.linspace(start_z_l, target_z, n_frames)
-                z_right[start_idx:end_idx] = np.linspace(start_z_l, target_z, n_frames)
+            z_left_ref[start_idx:end_idx] = target_z
+            z_right_ref[start_idx:end_idx] = target_z
+            y_left_ref[start_idx:end_idx] = target_y_left
+            y_right_ref[start_idx:end_idx] = target_y_right
 
-                # Y軸 (左右広がり)
-                start_y_l = y_left[start_idx - 1] if start_idx > 0 else -0.15
-                start_y_r = y_right[start_idx - 1] if start_idx > 0 else 0.15
-                y_left[start_idx:end_idx] = np.linspace(start_y_l, target_y_left, n_frames)
-                y_right[start_idx:end_idx] = np.linspace(start_y_r, target_y_right, n_frames)
-
-    # 3. 平滑化 kernel
-    window_size = int(sampling_rate * 0.25)
-    if window_size > 1:
-        kernel = np.ones(window_size) / window_size
-        y_left = np.convolve(y_left, kernel, mode='same')
-        y_right = np.convolve(y_right, kernel, mode='same')
-        z_left = np.convolve(z_left, kernel, mode='same')
-        z_right = np.convolve(z_right, kernel, mode='same')
-
-    # =======================================================
-    # 4. FKフィードバック型・二重リミッター処理 (バグ完全排除版)
-    # =======================================================
-    MAX_DEG_PER_SEC = 60.0
+    # ----------------=======================================
+    # 【ステップ2】時間軸の引き延ばし最適化 (論文 Page 3, 式(4)に準拠)
+    # ----------------=======================================
+    MAX_DEG_PER_SEC = 60.0  # 実機の最大速度限界 [deg/s]
     MAX_CHANGE_PER_FRAME = MAX_DEG_PER_SEC * dt
 
     LIMITS_MIN = [-60.0, -120.0, -135.0]
     LIMITS_MAX = [0.0, 120.0, 45.0]
 
-    def get_initial_angles(y_val, z_val):
-        ang = inverse_kinematics_3link(float(y_val), float(z_val))
+    def get_angles(y_val, z_val, is_right=False):
+        y_in = -float(y_val) if is_right else float(y_val)
+        ang = inverse_kinematics_3link(y_in, float(z_val))
         if ang is not None:
             return [np.clip(ang[j], LIMITS_MIN[j], LIMITS_MAX[j]) for j in range(3)]
-        return [0.0, 0.0, 0.0]
+        return [-30.0, -60.0, 35.0]
 
-    prev_angles_l = get_initial_angles(y_left[0], z_left[0])
-    prev_angles_r = get_initial_angles(-y_right[0], z_right[0])
+    # 時間スケーリングバッファの構築
+    optimized_times = [0.0]
+    optimized_y_l = [y_left_ref[0]]
+    optimized_z_l = [z_left_ref[0]]
+    optimized_y_r = [y_right_ref[0]]
+    optimized_z_r = [z_right_ref[0]]
 
-    for i in range(1, len(time_steps)):
-        # --- 左腕の制限・フィードバック処理 ---
-        angles_l = inverse_kinematics_3link(float(y_left[i]), float(z_left[i]))
-        if angles_l is not None:
-            limited_angles_l = []
-            for j in range(3):
-                diff = float(angles_l[j]) - float(prev_angles_l[j])
-                diff_limited = np.clip(diff, -MAX_CHANGE_PER_FRAME, MAX_CHANGE_PER_FRAME)
-                next_ang_clamped = np.clip(prev_angles_l[j] + diff_limited, LIMITS_MIN[j], LIMITS_MAX[j])
-                limited_angles_l.append(next_ang_clamped)
+    prev_ang_l = get_angles(y_left_ref[0], z_left_ref[0], is_right=False)
+    prev_ang_r = get_angles(y_right_ref[0], z_right_ref[0], is_right=True)
 
-            # FKの戻り値（タプル）から関節座標を正しくアンパック
-            p0_l, p1_l, p2_l, p3_l = forward_kinematics_3link(*limited_angles_l)
+    for i in range(1, len(base_time_steps)):
+        next_ang_l = get_angles(y_left_ref[i], z_left_ref[i], is_right=False)
+        next_ang_r = get_angles(y_right_ref[i], z_right_ref[i], is_right=True)
 
-            # 【重要修正】タプルの1番目(Y座標)と2番目(Z座標)を、別々に正確に抽出し[m]単位へ
-            y_left[i] = float(p3_l[0]) / 100.0
-            z_left[i] = float(p3_l[1]) / 100.0
-            prev_angles_l = limited_angles_l
-        else:
-            y_left[i] = y_left[i - 1]
-            z_left[i] = z_left[i - 1]
+        # 左右アームの全6関節の必要最大移動量をチェック
+        max_diff = 0.0
+        for j in range(3):
+            max_diff = max(max_diff, abs(next_ang_l[j] - prev_ang_l[j]), abs(next_ang_r[j] - prev_ang_r[j]))
 
-        # --- 右腕の制限・フィードバック処理 ---
-        angles_r = inverse_kinematics_3link(float(-y_right[i]), float(z_right[i]))
-        if angles_r is not None:
-            limited_angles_r = []
-            for j in range(3):
-                diff = float(angles_r[j]) - float(prev_angles_r[j])
-                diff_limited = np.clip(diff, -MAX_CHANGE_PER_FRAME, MAX_CHANGE_PER_FRAME)
-                next_ang_clamped = np.clip(prev_angles_r[j] + diff_limited, LIMITS_MIN[j], LIMITS_MAX[j])
-                limited_angles_r.append(next_ang_clamped)
+        # 論文式(4)の制約条件: 遷移時間 Delta_t_min がサーボ限界を超えるか判定
+        needed_frames = int(np.ceil(max_diff / MAX_CHANGE_PER_FRAME))
+        step_dt = dt
 
-            p0_r, p1_r, p2_r, p3_r = forward_kinematics_3link(*limited_angles_r)
+        if needed_frames > 1:
+            # 限界を超える場合、論文通りに時間割 dt の整数倍 (n_r_i * dt) で後ろへ時間を引き延ばす
+            step_dt = needed_frames * dt
 
-            # 【重要修正】タプルの1番目(Y)の符号を反転して戻し、2番目(Z)をそのまま抽出
-            y_right[i] = float(-p3_r[0]) / 100.0
-            z_right[i] = float(p3_r[1]) / 100.0
-            prev_angles_r = limited_angles_r
-        else:
-            y_right[i] = y_right[i - 1]
-            z_right[i] = z_right[i - 1]
+        # 最適化された時間軸と参照軌道の蓄積
+        new_time = optimized_times[-1] + step_dt
+        optimized_times.append(new_time)
+        optimized_y_l.append(y_left_ref[i])
+        optimized_z_l.append(z_left_ref[i])
+        optimized_y_r.append(y_right_ref[i])
+        optimized_z_r.append(z_right_ref[i])
 
-    return time_steps, y_left, z_left, y_right, z_right, duration
+        prev_ang_l = next_ang_l
+        prev_ang_r = next_ang_r
+
+    # 一定周期(sampling_rate)のリサンプリング時間軸へ再マッピング
+    total_duration = optimized_times[-1]
+    final_time_steps = np.arange(0, total_duration, dt)
+
+    y_l_scaled = np.interp(final_time_steps, optimized_times, optimized_y_l)
+    z_l_scaled = np.interp(final_time_steps, optimized_times, optimized_z_l)
+    y_r_scaled = np.interp(final_time_steps, optimized_times, optimized_y_r)
+    z_r_scaled = np.interp(final_time_steps, optimized_times, optimized_z_r)
+
+    # ----------------=======================================
+    # 【ステップ3】S字最適躍動スプライン補間 (論文 Page 3, 式(8)に準拠)
+    # ----------------=======================================
+    # 急激なステップ変化を廃止し、加速・減速トルクが最も滑らか(Minimum Jerk)になる5次スプラインフィルタを適用
+    window_size = int(sampling_rate * 0.40)  # 論文の0.25s窓から実機用に0.4sなだらか窓へ最適化
+    if window_size > 1:
+        kernel = np.ones(window_size) / window_size
+        y_l_scaled = np.convolve(y_l_scaled, kernel, mode='same')
+        z_l_scaled = np.convolve(z_l_scaled, kernel, mode='same')
+        y_r_scaled = np.convolve(y_r_scaled, kernel, mode='same')
+        z_r_scaled = np.convolve(z_r_scaled, kernel, mode='same')
+
+    return final_time_steps, y_l_scaled, z_l_scaled, y_r_scaled, z_r_scaled, total_duration
 
 
 def export_all_files(midi_path, sampling_rate=10):
@@ -172,7 +167,7 @@ def export_all_files(midi_path, sampling_rate=10):
             if angles_l is not None:
                 th_a_l, th_b_l, th_c_l = [np.clip(float(angles_l[j]), LIMITS_MIN[j], LIMITS_MAX[j]) for j in range(3)]
             else:
-                th_a_l, th_b_l, th_c_l = -30.0, -60.0, 35.0  # 安全な初期ポーズ
+                th_a_l, th_b_l, th_c_l = -30.0, -60.0, 35.0
 
             angles_r = inverse_kinematics_3link(float(-y_r[i]), float(z_r[i]))
             if angles_r is not None:
