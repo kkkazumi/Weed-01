@@ -102,7 +102,7 @@ def start_synchronized_viewer(midi_path):
     fig = plt.figure(figsize=(12, 10))
     # 4画面レイアウトの初期化
     ax_xy = fig.add_subplot(221)  # ① 左上: XY 平面図
-    ax_3d = fig.add_subplot(222, projection='3d')  # ② 右上: 3D 座標
+    #ax_3d = fig.add_subplot(222, projection='3d')  # ② 右上: 3D 座標
     ax_zy = fig.add_subplot(223)  # ③ 左下: ZY 平面図
     ax_xz = fig.add_subplot(224)  # ④ 右下: XZ 平面図
 
@@ -131,7 +131,7 @@ def start_synchronized_viewer(midi_path):
 
         # 全画面をクリア
         ax_xy.cla()
-        ax_3d.cla()
+        #ax_3d.cla()
         ax_zy.cla()
         ax_xz.cla()
 
@@ -159,36 +159,6 @@ def start_synchronized_viewer(midi_path):
         # ==========================================
         # ② 右上：3D ビュー (左右両腕を同時プロット)
         # ==========================================
-        # 左腕 (赤系統)
-        ax_3d.plot([p0_l[0], p1_l[0]], [p0_l[1] + y_offset_l, p1_l[1] + y_offset_l], [p0_l[2], p1_l[2]],
-                   color='darkred', linewidth=3)
-        ax_3d.plot([p1_l[0], p2_l[0]], [p1_l[1] + y_offset_l, p2_l[1] + y_offset_l], [p1_l[2], p2_l[2]], color='red',
-                   linewidth=3)
-        ax_3d.plot([p2_l[0], p3_l[0]], [p2_l[1] + y_offset_l, p3_l[1] + y_offset_l], [p2_l[2], p3_l[2]], color='orange',
-                   linewidth=3)
-        ax_3d.scatter(p3_l[0], p3_l[1] + y_offset_l, p3_l[2], color='red', s=60, edgecolors='black')
-        ax_3d.plot(hist_lx, hist_ly, hist_lz, color='red', alpha=0.2, linewidth=1)
-
-        # 右腕 (青系統)
-        ax_3d.plot([p0_r[0], p1_r[0]], [p0_r[1] + y_offset_r, p1_r[1] + y_offset_r], [p0_r[2], p1_r[2]],
-                   color='darkblue', linewidth=3)
-        ax_3d.plot([p1_r[0], p2_r[0]], [p1_r[1] + y_offset_r, p2_r[1] + y_offset_r], [p1_r[2], p2_r[2]], color='blue',
-                   linewidth=3)
-        ax_3d.plot([p2_r[0], p3_r[0]], [p2_r[1] + y_offset_r, p2_r[1] + y_offset_r], [p2_r[2], p3_r[2]], color='purple',
-                   linewidth=3)
-        ax_3d.scatter(p3_r[0], p3_r[1] + y_offset_r, p3_r[2], color='blue', s=60, edgecolors='black')
-        ax_3d.plot(hist_rx, hist_ry, hist_rz, color='blue', alpha=0.2, linewidth=1)
-
-        ax_3d.set_xlim([-25, 25]);
-        ax_3d.set_ylim([-35, 35]);
-        ax_3d.set_zlim([-25, 25])
-        ax_3d.set_xlabel('X (Depth)');
-        ax_3d.set_ylabel('Y (Left-Right)');
-        ax_3d.set_zlabel('Z (Up-Down)')
-        ax_3d.set_title('3D Multi-Arm View', pad=10)
-        ax_3d.view_init(elev=22, azim=-60)
-        ax_3d.text2D(0.02, 0.98, info_text, transform=ax_3d.transAxes, fontsize=8,
-                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='gray'))
 
         # ==========================================
         # ① 左上：XY 平面ビュー (真上からの見下ろし)
@@ -255,7 +225,7 @@ def start_synchronized_viewer(midi_path):
         fig.suptitle(f'Robot Arm Synchronized Drive [Time: {expected_time:.2f}s]', fontsize=13, y=0.96)
 
         # 描画負荷を完全に抑え、GUIのフリーズを確実に防ぐ
-        plt.pause(0.001)
+        plt.pause(0.01)
 
     pygame.mixer.music.stop()
     plt.ioff()
