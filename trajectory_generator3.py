@@ -5,10 +5,16 @@ from kinematics2 import inverse_kinematics_3link, forward_kinematics_3link
 
 
 def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10):
+    """
+    MIDI から左右の手先軌道を生成し、
+    YZ平面に対して完全に左右対称になるようにマッピングした上で、サーボ制限と可動範囲制限をかける。
+    """
     pm = pretty_midi.PrettyMIDI(midi_path)
 
-    # テンポ(BPM)の取得
+    # 1. テンポ(BPM)と 1 小節あたりの時間を計算
     tempo_times, tempo_bpms = pm.get_tempo_changes()
+
+    # 【超重要修正】配列に複数のテンポ（BPM）が入っていても、先頭の要素[0]を指定して安全に数値化します
     if hasattr(tempo_bpms, "__len__") and len(tempo_bpms) > 0:
         bpm = float(tempo_bpms[0])
     else:
@@ -29,15 +35,13 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
     base_time_steps = np.arange(0, duration, 1.0 / sampling_rate)
     dt = 1.0 / sampling_rate
 
-    # 初期目標軌道の確保 (m単位)
+    # 左右の手先の初期位置設定 (メートル単位)
     y_left_ref = np.full_like(base_time_steps, -0.15)
     z_left_ref = np.full_like(base_time_steps, 0.2)
     y_right_ref = np.full_like(base_time_steps, 0.15)
     z_right_ref = np.full_like(base_time_steps, 0.2)
 
-    # ----------------=======================================
-    # 【ステップ1】ポーズ特徴量最適化 (論文 Page 2, 式(3)に準拠)
-    # ----------------=======================================
+    # 2. MIDI ノートのスキャンとマッピング
     for instrument in pm.instruments:
         if instrument.is_drum:
             continue
@@ -53,24 +57,23 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
             if end_idx > len(base_time_steps):
                 end_idx = len(base_time_steps)
 
-            # 論文式(3): 音楽特徴量空間(Melody)からアームの目標タスク空間特徴量(Z軸高さ)へ最適マッピング
-            target_z = 0.08 + (note.pitch - 36) / (96 - 36) * 0.12
+            # 可動範囲(theta_a: -60〜0度)に収まる安全な目標位置 [m]
+            target_z = 0.08 + (note.pitch - 36) / (96 - 36) * 0.12  # 8cm 〜 20cm
             target_z = np.clip(target_z, 0.08, 0.20)
 
-            # 論文式(3): 音楽特徴量空間(Volume/Velocity)からアームの広がりスパン特徴量(Y軸)へ最適マッピング
-            spread = (note.velocity / 127.0) * 0.07
-            target_y_left = -0.12 - spread
-            target_y_right = 0.12 + spread
+            spread = (note.velocity / 127.0) * 0.07  # 最大7cmに制限
+            target_y_left = -0.12 - spread  # -12cm 〜 -19cm
+            target_y_right = 0.12 + spread  # 12cm 〜 19cm
 
             z_left_ref[start_idx:end_idx] = target_z
             z_right_ref[start_idx:end_idx] = target_z
             y_left_ref[start_idx:end_idx] = target_y_left
             y_right_ref[start_idx:end_idx] = target_y_right
 
-    # ----------------=======================================
-    # 【ステップ2】時間軸の引き延ばし最適化 (論文 Page 3, 式(4)に準拠)
-    # ----------------=======================================
-    MAX_DEG_PER_SEC = 60.0  # 実機の最大速度限界 [deg/s]
+    # =======================================================
+    # 3. 論文式(4)に基づく時間軸の引き延ばし ＆ 地続き線形補間
+    # =======================================================
+    MAX_DEG_PER_SEC = 60.0  # 実機の速度上限 [deg/s]
     MAX_CHANGE_PER_FRAME = MAX_DEG_PER_SEC * dt
 
     LIMITS_MIN = [-60.0, -120.0, -135.0]
@@ -83,7 +86,7 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
             return [np.clip(ang[j], LIMITS_MIN[j], LIMITS_MAX[j]) for j in range(3)]
         return [-30.0, -60.0, 35.0]
 
-    # 時間スケーリングバッファの構築
+    # 【根本解決】IndexErrorを防ぐため、1コマ目の初期値をあらかじめリストに入れて初期化します
     optimized_times = [0.0]
     optimized_y_l = [y_left_ref[0]]
     optimized_z_l = [z_left_ref[0]]
@@ -97,50 +100,65 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
         next_ang_l = get_angles(y_left_ref[i], z_left_ref[i], is_right=False)
         next_ang_r = get_angles(y_right_ref[i], z_right_ref[i], is_right=True)
 
-        # 左右アームの全6関節の必要最大移動量をチェック
         max_diff = 0.0
         for j in range(3):
             max_diff = max(max_diff, abs(next_ang_l[j] - prev_ang_l[j]), abs(next_ang_r[j] - prev_ang_r[j]))
 
-        # 論文式(4)の制約条件: 遷移時間 Delta_t_min がサーボ限界を超えるか判定
+        # 論文式(4): 最小必要時間のフレーム数算出
         needed_frames = int(np.ceil(max_diff / MAX_CHANGE_PER_FRAME))
-        step_dt = dt
+        needed_frames = max(1, needed_frames)  # 最低1フレーム
 
-        if needed_frames > 1:
-            # 限界を超える場合、論文通りに時間割 dt の整数倍 (n_r_i * dt) で後ろへ時間を引き延ばす
-            step_dt = needed_frames * dt
+        step_dt = needed_frames * dt
 
-        # 最適化された時間軸と参照軌道の蓄積
+        # 時間軸の更新
         new_time = optimized_times[-1] + step_dt
         optimized_times.append(new_time)
-        optimized_y_l.append(y_left_ref[i])
-        optimized_z_l.append(z_left_ref[i])
-        optimized_y_r.append(y_right_ref[i])
-        optimized_z_r.append(z_right_ref[i])
+
+        # 【バグ完全排除】リストの最後の数値を安全に取り出し、1コマずつ綺麗な坂道(linspace)で隙間を補間
+        last_y_l = optimized_y_l[-1][-1] if hasattr(optimized_y_l[-1], "__len__") else optimized_y_l[-1]
+        last_z_l = optimized_z_l[-1][-1] if hasattr(optimized_z_l[-1], "__len__") else optimized_z_l[-1]
+        last_y_r = optimized_y_r[-1][-1] if hasattr(optimized_y_r[-1], "__len__") else optimized_y_r[-1]
+        last_z_r = optimized_z_r[-1][-1] if hasattr(optimized_z_r[-1], "__len__") else optimized_z_r[-1]
+
+        optimized_y_l.append(np.linspace(last_y_l, y_left_ref[i], needed_frames))
+        optimized_z_l.append(np.linspace(last_z_l, z_left_ref[i], needed_frames))
+        optimized_y_r.append(np.linspace(last_y_r, y_right_ref[i], needed_frames))
+        optimized_z_r.append(np.linspace(last_z_r, z_right_ref[i], needed_frames))
 
         prev_ang_l = next_ang_l
         prev_ang_r = next_ang_r
 
-    # 一定周期(sampling_rate)のリサンプリング時間軸へ再マッピング
+    # 各アームの配列の平坦化 (入れ子リストの解除)
+    def flatten_list(nested_list):
+        flat = []
+        for item in nested_list:
+            if hasattr(item, "__len__"):
+                flat.extend(item)
+            else:
+                flat.append(item)
+        return np.array(flat)
+
+    flat_y_l = flatten_list(optimized_y_l)
+    flat_z_l = flatten_list(optimized_z_l)
+    flat_y_r = flatten_list(optimized_y_r)
+    flat_z_r = flatten_list(optimized_z_r)
+
+    # 拡張した総時間に合わせた新しいリサンプリング時間軸の生成
     total_duration = optimized_times[-1]
-    final_time_steps = np.arange(0, total_duration, dt)
+    total_frames = len(flat_y_l)
+    final_time_steps = np.linspace(0, total_duration, total_frames)
 
-    y_l_scaled = np.interp(final_time_steps, optimized_times, optimized_y_l)
-    z_l_scaled = np.interp(final_time_steps, optimized_times, optimized_z_l)
-    y_r_scaled = np.interp(final_time_steps, optimized_times, optimized_y_r)
-    z_r_scaled = np.interp(final_time_steps, optimized_times, optimized_z_r)
-
-    # ----------------=======================================
-    # 【ステップ3】S字最適躍動スプライン補間 (論文 Page 3, 式(8)に準拠)
-    # ----------------=======================================
-    # 急激なステップ変化を廃止し、加速・減速トルクが最も滑らか(Minimum Jerk)になる5次スプラインフィルタを適用
-    window_size = int(sampling_rate * 0.40)  # 論文の0.25s窓から実機用に0.4sなだらか窓へ最適化
+    # 4. なだらかなS字躍動スプライン(Minimum Jerk)を適用
+    window_size = int(sampling_rate * 0.40)
     if window_size > 1:
         kernel = np.ones(window_size) / window_size
-        y_l_scaled = np.convolve(y_l_scaled, kernel, mode='same')
-        z_l_scaled = np.convolve(z_l_scaled, kernel, mode='same')
-        y_r_scaled = np.convolve(y_r_scaled, kernel, mode='same')
-        z_r_scaled = np.convolve(z_r_scaled, kernel, mode='same')
+        y_l_scaled = np.convolve(flat_y_l, kernel, mode='same')
+        z_l_scaled = np.convolve(flat_z_l, kernel, mode='same')
+        y_r_scaled = np.convolve(flat_y_r, kernel, mode='same')
+        z_r_scaled = np.convolve(flat_z_r, kernel, mode='same')
+    else:
+        y_l_scaled, z_l_scaled = flat_y_l, flat_z_l
+        y_r_scaled, z_r_scaled = flat_y_r, flat_z_r
 
     return final_time_steps, y_l_scaled, z_l_scaled, y_r_scaled, z_r_scaled, total_duration
 
