@@ -15,8 +15,9 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
     # 1. テンポ(BPM)と 1 小節あたりの時間を計算
     tempo_times, tempo_bpms = pm.get_tempo_changes()
 
+    # 【超重要修正】配列の一番最初の要素 [0] から、本来の正しいBPM数値を正確に取り出す
     if hasattr(tempo_bpms, "__len__") and len(tempo_bpms) > 0:
-        bpm = float(tempo_bpms[0])
+        bpm = float(tempo_bpms[0])  # [0] を指定して配列の先頭の値を取得
     else:
         bpm = float(tempo_bpms) if tempo_bpms is not None else 120.0
 
@@ -64,10 +65,19 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
             target_y_left = -0.05 - spread
             target_y_right = 0.05 + spread
 
-            z_left[start_idx:end_idx] = target_z
-            z_right[start_idx:end_idx] = target_z
-            y_left[start_idx:end_idx] = target_y_left
-            y_right[start_idx:end_idx] = target_y_right
+            # 【大改良】固定値代入から、音符の長さをフルに使ったなめらかな直線補間（スライド）に変更
+            n_frames = end_idx - start_idx
+            if n_frames > 0:
+                # 1. Z軸：直前の位置から、今回の目標Zまでゆっくり移動させる
+                start_z_l = y_left[start_idx - 1] if start_idx > 0 else 0.2
+                z_left[start_idx:end_idx] = np.linspace(start_z_l, target_z, n_frames)
+                z_right[start_idx:end_idx] = np.linspace(start_z_l, target_z, n_frames)  # 右も同期
+
+                # 2. Y軸：直前の広がり位置から、今回の目標Yまでゆっくり移動させる
+                start_y_l = y_left[start_idx - 1] if start_idx > 0 else -0.15
+                start_y_r = y_right[start_idx - 1] if start_idx > 0 else 0.15
+                y_left[start_idx:end_idx] = np.linspace(start_y_l, target_y_left, n_frames)
+                y_right[start_idx:end_idx] = np.linspace(start_y_r, target_y_right, n_frames)
 
     # 3. 平滑化
     window_size = int(sampling_rate * 0.25)
