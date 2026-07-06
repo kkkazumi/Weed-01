@@ -3,7 +3,7 @@ import numpy as np
 import pretty_midi
 
 # kinematics から正しい関数をインポート
-from kinematics import inverse_kinematics_3link, forward_kinematics_3link
+from kinematics2 import inverse_kinematics_3link, forward_kinematics_3link
 
 
 def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10):
