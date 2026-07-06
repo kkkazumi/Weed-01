@@ -1,23 +1,21 @@
 import csv
 import numpy as np
 import pretty_midi
-
-# kinematics から正しい関数をインポート
 from kinematics import inverse_kinematics_3link, forward_kinematics_3link
 
 
 def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10):
     """
-    MIDI から左右の手先軌道を生成し、サーボ制限と可動範囲制限をかける。
+    MIDI から左右の手先軌道を生成し、
+    YZ平面に対して完全に左右対称になるようにマッピングした上で、サーボ制限と可動範囲制限をかける。
     """
     pm = pretty_midi.PrettyMIDI(midi_path)
 
     # 1. テンポ(BPM)と 1 小節あたりの時間を計算
     tempo_times, tempo_bpms = pm.get_tempo_changes()
 
-    # 【超重要修正】配列の一番最初の要素 [0] から、本来の正しいBPM数値を正確に取り出す
     if hasattr(tempo_bpms, "__len__") and len(tempo_bpms) > 0:
-        bpm = float(tempo_bpms[0])  # [0] を指定して配列の先頭の値を取得
+        bpm = float(tempo_bpms[0])
     else:
         bpm = float(tempo_bpms) if tempo_bpms is not None else 120.0
 
@@ -58,22 +56,23 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
             if end_idx > len(time_steps):
                 end_idx = len(time_steps)
 
-            target_z = 0.1 + (note.pitch - 36) / (96 - 36) * 0.35
-            target_z = np.clip(target_z, 0.1, 0.45)
+            # 【マッピング修正】可動範囲(theta_a: -60〜0度)に収まる安全な手先位置
+            target_z = 0.05 + (note.pitch - 36) / (96 - 36) * 0.15
+            target_z = np.clip(target_z, 0.05, 0.20)
 
-            spread = (note.velocity / 127.0) * 0.25
-            target_y_left = -0.05 - spread
-            target_y_right = 0.05 + spread
+            spread = (note.velocity / 127.0) * 0.08
+            target_y_left = -0.10 - spread  # 左腕はマイナス方向（外側）へ広がる
+            target_y_right = 0.10 + spread  # 右腕はプラス方向（外側）へ広がる
 
-            # 【大改良】固定値代入から、音符の長さをフルに使ったなめらかな直線補間（スライド）に変更
+            # なめらかな直線補間の計算
             n_frames = end_idx - start_idx
             if n_frames > 0:
-                # 1. Z軸：直前の位置から、今回の目標Zまでゆっくり移動させる
-                start_z_l = y_left[start_idx - 1] if start_idx > 0 else 0.2
+                # Z軸 (高さ)
+                start_z_l = z_left[start_idx - 1] if start_idx > 0 else 0.2
                 z_left[start_idx:end_idx] = np.linspace(start_z_l, target_z, n_frames)
-                z_right[start_idx:end_idx] = np.linspace(start_z_l, target_z, n_frames)  # 右も同期
+                z_right[start_idx:end_idx] = np.linspace(start_z_l, target_z, n_frames)
 
-                # 2. Y軸：直前の広がり位置から、今回の目標Yまでゆっくり移動させる
+                # Y軸 (左右広がり)
                 start_y_l = y_left[start_idx - 1] if start_idx > 0 else -0.15
                 start_y_r = y_right[start_idx - 1] if start_idx > 0 else 0.15
                 y_left[start_idx:end_idx] = np.linspace(start_y_l, target_y_left, n_frames)
@@ -89,10 +88,10 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
         z_right = np.convolve(z_right, kernel, mode='same')
 
     # =======================================================
-    # 4. 【大改良】FKフィードバック型・二重リミッター処理
+    # 4. FKフィードバック型・二重リミッター処理 (左右対称対応)
     # =======================================================
-    MAX_DEG_PER_SEC = 60.0  # 60度/秒
-    MAX_CHANGE_PER_FRAME = MAX_DEG_PER_SEC * dt  # 1フレームで動いていい最大角度 [deg]
+    MAX_DEG_PER_SEC = 60.0
+    MAX_CHANGE_PER_FRAME = MAX_DEG_PER_SEC * dt
 
     LIMITS_MIN = [-60.0, -120.0, -135.0]
     LIMITS_MAX = [0.0, 120.0, 45.0]
@@ -103,66 +102,43 @@ def generate_trajectory(midi_path, start_bar=0, num_bars=None, sampling_rate=10)
             return [np.clip(ang[j], LIMITS_MIN[j], LIMITS_MAX[j]) for j in range(3)]
         return [0.0, 0.0, 0.0]
 
-    # 1つ前の「実際に確定した」安全な角度
     prev_angles_l = get_initial_angles(y_left[0], z_left[0])
-    prev_angles_r = get_initial_angles(y_right[0], z_right[0])
+    # 右腕はベース位置を左アームと同じ座標系（マイナス側）に一度鏡像反転してIKの初期値を計算します
+    prev_angles_r = get_initial_angles(-y_right[0], z_right[0])
 
     for i in range(1, len(time_steps)):
-        # ---------------------------------------------------
-        # 【左腕】FKフィードバック追従ループ
-        # ---------------------------------------------------
-        # 前のフレームで「実際にアームが到達した修正済みの座標」をベースにIKを解く
-        # (これにより、目標がワープしてもアームは現在地から地続きで計算を始められます)
+        # --- 左腕の制限・フィードバック処理 ---
         angles_l = inverse_kinematics_3link(float(y_left[i]), float(z_left[i]), phi_deg=0.0)
-
         if angles_l is not None:
             limited_angles_l = []
             for j in range(3):
-                # ① 60 deg/sec の速度制限を現在の位置（prev）基準で厳密にチェック
                 diff = float(angles_l[j]) - float(prev_angles_l[j])
                 diff_limited = np.clip(diff, -MAX_CHANGE_PER_FRAME, MAX_CHANGE_PER_FRAME)
-                next_ang = prev_angles_l[j] + diff_limited
-
-                # ② 物理的な可動限界の壁でクリップ
-                next_ang_clamped = np.clip(next_ang, LIMITS_MIN[j], LIMITS_MAX[j])
+                next_ang_clamped = np.clip(prev_angles_l[j] + diff_limited, LIMITS_MIN[j], LIMITS_MAX[j])
                 limited_angles_l.append(next_ang_clamped)
 
-            # 【重要】制限して確定した安全な角度から、FKで「実際の現在地」を逆算
             _, _, _, p3_l = forward_kinematics_3link(*limited_angles_l)
-
-            # 手先位置の配列を「アームが物理的に追いついた本物の座標」で上書き
-            # これにより、次のフレーム（i+1）のIKは、この無理のない位置から地続きでスタートします
-            y_left[i] = float(p3_l[0]) / 100.0  # タプルのX(2D上のY)
-            z_left[i] = float(p3_l[1]) / 100.0  # タプルのY(2D上のZ)
-
-            # 確定角度を保存
+            y_left[i] = float(p3_l[0]) / 100.0
+            z_left[i] = float(p3_l[1]) / 100.0
             prev_angles_l = limited_angles_l
         else:
-            # 万が一IKの解が外れた場合は、その場に留まる（速度0）
             y_left[i] = y_left[i - 1]
             z_left[i] = z_left[i - 1]
 
-        # ---------------------------------------------------
-        # 【右腕】FKフィードバック追従ループ
-        # ---------------------------------------------------
-        angles_r = inverse_kinematics_3link(float(y_right[i]), float(z_right[i]), phi_deg=0.0)
-
+        # --- 右腕の制限・フィードバック処理 【超重要：YZ平面対称反転】 ---
+        # 右腕の目標Y座標の符号を反転（-y_right）させることで、左腕モデルの可動範囲設定をそのまま流用して鏡像のIKを解きます
+        angles_r = inverse_kinematics_3link(float(-y_right[i]), float(z_right[i]), phi_deg=0.0)
         if angles_r is not None:
             limited_angles_r = []
             for j in range(3):
-                # ① 速度制限
                 diff = float(angles_r[j]) - float(prev_angles_r[j])
                 diff_limited = np.clip(diff, -MAX_CHANGE_PER_FRAME, MAX_CHANGE_PER_FRAME)
-                next_ang = prev_angles_r[j] + diff_limited
-
-                # ② 可動限界制限
-                next_ang_clamped = np.clip(next_ang, LIMITS_MIN[j], LIMITS_MAX[j])
+                next_ang_clamped = np.clip(prev_angles_r[j] + diff_limited, LIMITS_MIN[j], LIMITS_MAX[j])
                 limited_angles_r.append(next_ang_clamped)
 
-            # FKで実際の現在地を逆算
             _, _, _, p3_r = forward_kinematics_3link(*limited_angles_r)
-
-            y_right[i] = float(p3_r[0]) / 100.0
+            # 逆算したFK結果のY座標の符号を元に戻して右腕の現在地を確定
+            y_right[i] = float(-p3_r[0]) / 100.0
             z_right[i] = float(p3_r[1]) / 100.0
             prev_angles_r = limited_angles_r
         else:
@@ -196,7 +172,8 @@ def export_all_files(midi_path, sampling_rate=10):
             else:
                 th_a_l, th_b_l, th_c_l = 0.0, 0.0, 0.0
 
-            angles_r = inverse_kinematics_3link(float(y_r[i]), float(z_r[i]), phi_deg=0.0)
+            # 【重要】右腕用の角度CSVにも、反転した手先位置から算出した「対称角度」を正確に記録します
+            angles_r = inverse_kinematics_3link(float(-y_r[i]), float(z_r[i]), phi_deg=0.0)
             if angles_r is not None:
                 th_a_r, th_b_r, th_c_r = [np.clip(float(angles_r[j]), LIMITS_MIN[j], LIMITS_MAX[j]) for j in range(3)]
             else:
@@ -213,9 +190,9 @@ def export_all_files(midi_path, sampling_rate=10):
 
     with open("duration.txt", mode='w', encoding='utf-8') as f:
         f.write(f"{total_duration:.2f}\n")
-    print("--- 角度・設定ファイルのエクスポート完了 ---")
+    print("--- 左右対称＆実機仕様制限付き 角度ファイルエクスポート完了 ---")
 
 
 if __name__ == '__main__':
-    midi_file = "airsulg.mid"
+    midi_file = "radetzky.mid"
     export_all_files(midi_file, sampling_rate=10)

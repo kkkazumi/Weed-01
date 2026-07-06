@@ -273,5 +273,5 @@ def start_synchronized_viewer(midi_path):
 
 
 if __name__ == '__main__':
-    midi_file = "airsulg.mid"
+    midi_file = "radetzky.mid"
     start_synchronized_viewer(midi_file)
